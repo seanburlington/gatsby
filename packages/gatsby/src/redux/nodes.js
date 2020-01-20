@@ -103,6 +103,10 @@ exports.saveResolvedNodes = async (nodeTypeNames, resolver) => {
   }
 }
 
+const getResolvedNodesCache = () => store.getState().resolvedNodesCache
+
+exports.getResolvedNodesCache = getResolvedNodesCache
+
 /**
  * Get node and save path dependency.
  *
@@ -154,3 +158,94 @@ const addResolvedNodes = (typeName, arr) => {
 }
 
 exports.addResolvedNodes = addResolvedNodes
+
+// TODO: This local cache is "global" to the nodejs instance. It should be
+//       reset after each point where nodes are mutated. This is currently
+//       not the case. I don't think we want to persist this cache in redux.
+//       (This works currently fine for a `build`, but won't for `develop`)
+let mappedByKey
+
+const ensureIndexByTypedChain = (chain, nodeTypeNames) => {
+  const chained = chain.join(`+`)
+
+  if (chained === `id`) {
+    return
+  }
+
+  if (!mappedByKey) {
+    mappedByKey = new Map()
+  }
+
+  const nodeTypeNamePrefix = nodeTypeNames.join(`,`) + `/`
+  // The format of the typedKey is `type,type/path+to+eqobj`
+  const typedKey = nodeTypeNamePrefix + chained
+
+  let byKeyValue = mappedByKey.get(typedKey)
+  if (byKeyValue) {
+    return
+  }
+
+  const { nodes, resolvedNodesCache } = store.getState()
+
+  byKeyValue = new Map() // Map<node.value, Set<all nodes with this value for this key>>
+  mappedByKey.set(typedKey, byKeyValue)
+
+  nodes.forEach(node => {
+    if (!nodeTypeNames.includes(node.internal.type)) {
+      return
+    }
+
+    // Walk the chain in the node to find the filter target
+    let v = node
+    let i = 0
+    while (i < chain.length && v) {
+      const nextProp = chain[i++]
+      v = v[nextProp]
+    }
+
+    if (typeof v !== `string` || i !== chain.length) {
+      // Not sure whether this is supposed to happen, but this means that either
+      // - The node chain ended with `undefined`, or
+      // - The node chain ended in something other than a string, or
+      // - A part in the chain in the object was not an object
+      return
+    }
+
+    let set = byKeyValue.get(v)
+    if (!set) {
+      set = new Set()
+      byKeyValue.set(v, set)
+    }
+    set.add(node)
+
+    if (!node.__gatsby_resolved) {
+      const typeName = node.internal.type
+      const resolvedNodes = resolvedNodesCache.get(typeName)
+      node.__gatsby_resolved = resolvedNodes?.get(node.id)
+    }
+  })
+}
+
+exports.ensureIndexByTypedChain = ensureIndexByTypedChain
+
+const getNodesByTypedChain = (chain, value, nodeTypeNames) => {
+  const key = chain.join(`+`)
+
+  if (key === `id`) {
+    const node = getNode(value)
+
+    if (nodeTypeNames.includes(node.internal.type)) {
+      return node
+    }
+
+    return undefined
+  }
+
+  const typedKey = nodeTypeNames.join(`,`) + `/` + key
+
+  let byTypedKey = mappedByKey?.get(typedKey)
+
+  return byTypedKey?.get(value)
+}
+
+exports.getNodesByTypedChain = getNodesByTypedChain

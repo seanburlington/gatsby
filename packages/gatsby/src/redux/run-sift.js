@@ -9,6 +9,13 @@ const {
   objectToDottedField,
   liftResolvedFields,
 } = require(`../db/common/query`)
+const {
+  ensureIndexByTypedChain,
+  getNodesByTypedChain,
+  getResolvedNodesCache,
+  addResolvedNodes,
+  getNode,
+} = require(`./nodes`)
 
 /////////////////////////////////////////////////////////////////////
 // Parse filter
@@ -123,24 +130,67 @@ function handleMany(siftArgs, nodes, sort, resolvedFields) {
  *   if `firstOnly` is true
  */
 const runSift = (args: Object) => {
-  const { getNode, addResolvedNodes, getResolvedNode } = require(`./nodes`)
+  const { nodeTypeNames, firstOnly = false } = args
 
-  const { nodeTypeNames } = args
-  if (
-    args.queryArgs?.filter &&
-    Object.getOwnPropertyNames(args.queryArgs.filter).length === 1 &&
-    typeof args.queryArgs.filter?.id?.eq === `string`
-  ) {
-    // The args have an id.eq which subsumes all other queries
-    // Since the id of every node is unique there can only ever be one node found this way. Find it and return it.
-    let id = args.queryArgs.filter.id.eq
-    let node = undefined
-    nodeTypeNames.some(typeName => {
-      node = getResolvedNode(typeName, id)
-      return !!node
-    })
-    if (node) {
-      return [node]
+  const filter = args.queryArgs?.filter
+  if (filter) {
+    // This can be any string of {a: {b: {c: {eq: "x"}}}} and we want to confirm there is exactly one leaf in this
+    // structure and that this leaf is `eq`. The actual names are irrelevant, they are props on each node.
+
+    // TODO: This seems to perform okay but is it faster to just JSON.stringify the filter and use regexes to get the chain...?
+    let chain = []
+    let props = Object.getOwnPropertyNames(filter)
+    let obj = filter
+    while (props?.length === 1 && props[0] !== `eq`) {
+      chain.push(props[0])
+      obj = obj[props[0]]
+      if (obj) {
+        props = Object.getOwnPropertyNames(obj)
+      } else {
+        props = []
+      }
+    }
+
+    // Now either we reached an `eq` (still need to confirm that this is a leaf node), or the current
+    // object has multiple props and we must bail because we currently don't support that (too complex).
+    let targetValue = obj?.[props[0]]
+    if (
+      props.length === 1 &&
+      (typeof targetValue === `string` ||
+        typeof targetValue === `boolean` ||
+        typeof targetValue === `number`)
+    ) {
+      // `chain` should now be: `filter = {this: {is: {the: {chain: {eq: "foo"}}}}}` -> `['this', 'is', 'the', 'chain']`
+
+      // Extra shortcut for `id`, which we internally index by anyways, so no need to setup anything else
+      if (chain.join(`,`) === `id`) {
+        const node = getNode(targetValue)
+        if (node && nodeTypeNames.includes(node.internal.type)) {
+          const resolvedNodesCache = getResolvedNodesCache()
+          const resolvedNodes = resolvedNodesCache?.get(node.internal.type)
+          if (resolvedNodes) {
+            node.__gatsby_resolved = resolvedNodes.get(node.id)
+          }
+          return [node]
+        }
+        if (firstOnly) {
+          return []
+        }
+        return null
+      }
+
+      ensureIndexByTypedChain(chain, nodeTypeNames)
+
+      const nodesByKeyValue = getNodesByTypedChain(
+        chain,
+        targetValue,
+        nodeTypeNames
+      )
+
+      if (nodesByKeyValue?.size > 0) {
+        return [...nodesByKeyValue]
+      }
+      // Not sure if we can just return `undefined` on a miss here
     }
   }
 
